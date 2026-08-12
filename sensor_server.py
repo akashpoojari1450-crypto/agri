@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from pydantic import BaseModel
 from datetime import datetime
 import sqlite3
 import os
@@ -22,6 +23,20 @@ def init_db():
             crop TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS diagnoses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            crop TEXT,
+            moisture INTEGER,
+            ph REAL,
+            n INTEGER,
+            p INTEGER,
+            k INTEGER,
+            diagnosis_text TEXT,
+            product_query TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -37,6 +52,18 @@ sensor_data = {
 }
 
 MAX_HISTORY = 200
+MAX_DIAGNOSIS_HISTORY = 100
+
+
+class DiagnosisRecord(BaseModel):
+    crop: str
+    moisture: int
+    ph: float
+    n: int
+    p: int
+    k: int
+    diagnosis_text: str
+    product_query: str | None = None
 
 
 @app.get("/")
@@ -47,7 +74,9 @@ def home():
         "update_endpoint": "/update",
         "sensor_endpoint": "/sensor-data",
         "history_endpoint": "/history",
-        "weather_endpoint": "/weather-forecast?lat=..&lon=.."
+        "weather_endpoint": "/weather-forecast?lat=..&lon=..",
+        "save_diagnosis_endpoint": "/save-diagnosis (POST)",
+        "diagnosis_history_endpoint": "/diagnosis-history"
     }
 
 
@@ -112,6 +141,60 @@ def get_sensor_history():
     return {
         "count": len(readings),
         "readings": readings
+    }
+
+
+@app.post("/save-diagnosis")
+def save_diagnosis(record: DiagnosisRecord):
+    """
+    Saves one AI diagnosis result to history. Called by Streamlit right
+    after a Gemini diagnosis completes (auto-triggered or manual button),
+    so every diagnosis shown in the app is also logged here.
+    """
+    timestamp = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO diagnoses (timestamp, crop, moisture, ph, n, p, k, diagnosis_text, product_query) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            timestamp, record.crop, record.moisture, record.ph,
+            record.n, record.p, record.k, record.diagnosis_text, record.product_query
+        )
+    )
+    conn.execute("""
+        DELETE FROM diagnoses
+        WHERE id NOT IN (
+            SELECT id FROM diagnoses ORDER BY id DESC LIMIT ?
+        )
+    """, (MAX_DIAGNOSIS_HISTORY,))
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "message": "Diagnosis saved",
+        "timestamp": timestamp
+    }
+
+
+@app.get("/diagnosis-history")
+def get_diagnosis_history(limit: int = 50):
+    """Returns past diagnoses, most recent first."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT timestamp, crop, moisture, ph, n, p, k, diagnosis_text, product_query "
+        "FROM diagnoses ORDER BY id DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+
+    history = [dict(row) for row in rows]
+
+    return {
+        "count": len(history),
+        "history": history
     }
 
 
