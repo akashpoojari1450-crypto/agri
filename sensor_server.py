@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from datetime import datetime
 import sqlite3
 import os
+import hashlib
+import secrets
 import requests
 
 app = FastAPI(title="Agri-Pulse IoT API")
@@ -37,6 +39,31 @@ def init_db():
             product_query TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            username TEXT PRIMARY KEY,
+            crop TEXT DEFAULT 'Tomato',
+            field_lat REAL,
+            field_lon REAL,
+            alert_email TEXT,
+            selected_language TEXT DEFAULT 'English',
+            FOREIGN KEY (username) REFERENCES users (username)
+        )
+    """)
+
+    try:
+        conn.execute("ALTER TABLE diagnoses ADD COLUMN username TEXT")
+    except sqlite3.OperationalError:
+        pass  # already exists
+
     conn.commit()
     conn.close()
 
@@ -64,6 +91,39 @@ class DiagnosisRecord(BaseModel):
     k: int
     diagnosis_text: str
     product_query: str | None = None
+    username: str | None = None
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserSettings(BaseModel):
+    username: str
+    crop: str | None = None
+    field_lat: float | None = None
+    field_lon: float | None = None
+    alert_email: str | None = None
+    selected_language: str | None = None
+
+
+def hash_password(password: str, salt: bytes | None = None):
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    return pwd_hash.hex(), salt.hex()
+
+
+def verify_password(password: str, stored_hash_hex: str, salt_hex: str) -> bool:
+    salt = bytes.fromhex(salt_hex)
+    new_hash, _ = hash_password(password, salt)
+    return secrets.compare_digest(new_hash, stored_hash_hex)
 
 
 @app.get("/")
@@ -76,7 +136,10 @@ def home():
         "history_endpoint": "/history",
         "weather_endpoint": "/weather-forecast?lat=..&lon=..",
         "save_diagnosis_endpoint": "/save-diagnosis (POST)",
-        "diagnosis_history_endpoint": "/diagnosis-history"
+        "diagnosis_history_endpoint": "/diagnosis-history?username=..&crop=..&start_date=..&end_date=..",
+        "register_endpoint": "/register (POST)",
+        "login_endpoint": "/login (POST)",
+        "settings_endpoint": "/settings (GET/POST)"
     }
 
 
@@ -146,20 +209,16 @@ def get_sensor_history():
 
 @app.post("/save-diagnosis")
 def save_diagnosis(record: DiagnosisRecord):
-    """
-    Saves one AI diagnosis result to history. Called by Streamlit right
-    after a Gemini diagnosis completes (auto-triggered or manual button),
-    so every diagnosis shown in the app is also logged here.
-    """
     timestamp = datetime.utcnow().isoformat()
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO diagnoses (timestamp, crop, moisture, ph, n, p, k, diagnosis_text, product_query) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO diagnoses (timestamp, crop, moisture, ph, n, p, k, diagnosis_text, product_query, username) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             timestamp, record.crop, record.moisture, record.ph,
-            record.n, record.p, record.k, record.diagnosis_text, record.product_query
+            record.n, record.p, record.k, record.diagnosis_text,
+            record.product_query, record.username
         )
     )
     conn.execute("""
@@ -179,17 +238,42 @@ def save_diagnosis(record: DiagnosisRecord):
 
 
 @app.get("/diagnosis-history")
-def get_diagnosis_history(limit: int = 50):
-    """Returns past diagnoses, most recent first."""
+def get_diagnosis_history(
+    limit: int = 50,
+    username: str | None = None,
+    crop: str | None = None,
+    start_date: str | None = None,  # "YYYY-MM-DD"
+    end_date: str | None = None,    # "YYYY-MM-DD"
+):
+    """Returns past diagnoses, most recent first. Optionally filtered by
+    username, crop, and/or a date range (inclusive)."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT timestamp, crop, moisture, ph, n, p, k, diagnosis_text, product_query "
-        "FROM diagnoses ORDER BY id DESC LIMIT ?",
-        (limit,)
-    ).fetchall()
-    conn.close()
 
+    query = (
+        "SELECT timestamp, crop, moisture, ph, n, p, k, diagnosis_text, product_query, username "
+        "FROM diagnoses WHERE 1=1"
+    )
+    params = []
+
+    if username:
+        query += " AND username = ?"
+        params.append(username)
+    if crop:
+        query += " AND crop = ?"
+        params.append(crop)
+    if start_date:
+        query += " AND timestamp >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND timestamp <= ?"
+        params.append(end_date + "T23:59:59")
+
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
     history = [dict(row) for row in rows]
 
     return {
@@ -200,11 +284,6 @@ def get_diagnosis_history(limit: int = 50):
 
 @app.get("/weather-forecast")
 def get_weather_forecast(lat: float, lon: float):
-    """
-    Fetches today + next 3 days forecast for the given field coordinates.
-    lat/lon are passed in by the caller (Streamlit app), not hardcoded,
-    so this works for any user's field location.
-    """
     try:
         url = (
             "https://api.open-meteo.com/v1/forecast"
@@ -230,8 +309,94 @@ def get_weather_forecast(lat: float, lon: float):
             "status": "success",
             "lat": lat,
             "lon": lon,
-            "forecast": forecast  # index 0 = today, 1-3 = next 3 days
+            "forecast": forecast
         }
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ===========================================================
+# AUTH & PER-USER SETTINGS
+# ===========================================================
+
+@app.post("/register")
+def register(req: RegisterRequest):
+    username = req.username.strip()
+    if not username or not req.password:
+        return {"status": "error", "message": "Username and password are required."}
+    if len(req.password) < 6:
+        return {"status": "error", "message": "Password must be at least 6 characters."}
+
+    conn = sqlite3.connect(DB_PATH)
+    existing = conn.execute("SELECT username FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        conn.close()
+        return {"status": "error", "message": "That username is already taken."}
+
+    pwd_hash, salt = hash_password(req.password)
+    conn.execute(
+        "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+        (username, pwd_hash, salt, datetime.utcnow().isoformat())
+    )
+    conn.execute(
+        "INSERT INTO user_settings (username, crop, selected_language) VALUES (?, ?, ?)",
+        (username, "Tomato", "English")
+    )
+    conn.commit()
+    conn.close()
+
+    return {"status": "success", "message": "Account created.", "username": username}
+
+
+@app.post("/login")
+def login(req: LoginRequest):
+    username = req.username.strip()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+
+    if not row or not verify_password(req.password, row["password_hash"], row["salt"]):
+        return {"status": "error", "message": "Invalid username or password."}
+
+    return {"status": "success", "message": "Login successful.", "username": row["username"]}
+
+
+@app.get("/settings")
+def get_settings(username: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM user_settings WHERE username = ?", (username,)).fetchone()
+    conn.close()
+
+    if not row:
+        return {"status": "error", "message": "No settings found for this user."}
+
+    return {"status": "success", "settings": dict(row)}
+
+
+@app.post("/settings")
+def update_settings(settings: UserSettings):
+    conn = sqlite3.connect(DB_PATH)
+    existing = conn.execute(
+        "SELECT username FROM user_settings WHERE username = ?", (settings.username,)
+    ).fetchone()
+    if not existing:
+        conn.execute("INSERT INTO user_settings (username) VALUES (?)", (settings.username,))
+
+    fields, values = [], []
+    for field in ["crop", "field_lat", "field_lon", "alert_email", "selected_language"]:
+        val = getattr(settings, field)
+        if val is not None:
+            fields.append(f"{field} = ?")
+            values.append(val)
+
+    if fields:
+        values.append(settings.username)
+        conn.execute(f"UPDATE user_settings SET {', '.join(fields)} WHERE username = ?", values)
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "success", "message": "Settings updated."}
